@@ -1,69 +1,39 @@
-// server.js — Ultra scalper detector (Binance aggTrade -> Telegram)
-// Requires: axios, ws, dotenv
 require('dotenv').config();
-const axios = require('axios');
 const WebSocket = require('ws');
+const axios = require('axios');
 
-// ================== CONFIG ==================
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
-const CHAT_ID   = process.env.CHAT_ID   || "";
+const CHAT_ID = process.env.CHAT_ID || "";
 
 if (!BOT_TOKEN || !CHAT_ID) {
-    console.error("✖ BOT_TOKEN أو CHAT_ID غير مضبوطين. ضعهما في Environment Variables على Render.");
+    console.error("✖ BOT_TOKEN أو CHAT_ID غير مضبوطين.");
     process.exit(1);
 }
 
-const BINANCE_REST = "https://api.binance.com/api/v3";
+const TOP_SYMBOLS = [
+    "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","ADAUSDT",
+    "SOLUSDT","DOGEUSDT","DOTUSDT","MATICUSDT","LTCUSDT"
+    // أضف باقي الرموز حسب حاجتك (150 رمز لو تحب)
+];
 
-const TOP_N = process.env.TOP_N ? parseInt(process.env.TOP_N) : 150; // عدد الأزواج الأعلى بالحجم
-const WINDOW_SEC = process.env.WINDOW_SEC ? parseInt(process.env.WINDOW_SEC) : 20; // النافذة الزمنية (بالثواني)
-const THRESHOLD_PERCENT = process.env.THRESHOLD_PERCENT ? parseFloat(process.env.THRESHOLD_PERCENT) : 0.4; // نسبة الإنذار
-const ALERT_COOLDOWN_SEC = process.env.ALERT_COOLDOWN_SEC ? parseInt(process.env.ALERT_COOLDOWN_SEC) : 60; // كولداون للرمز
-const MAX_STREAMS_PER_WS = 800; // حد آمن للـ WebSocket
+const WINDOW_SEC = 20;
+const THRESHOLD_PERCENT = 0.4;
+const ALERT_COOLDOWN_SEC = 60;
+const MAX_STREAMS_PER_WS = 800;
 
-// ================ Helper: Send Telegram ================
+const priceWindows = new Map();
+const lastAlertTs = new Map();
+
 async function sendToTelegram(text) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
     try {
-        await axios.post(url, {
-            chat_id: CHAT_ID,
-            text,
-            parse_mode: "HTML"
-        });
+        await axios.post(url, { chat_id: CHAT_ID, text, parse_mode: "HTML" });
         console.log("✅ إشعار تليقرام:", text.split("\n")[0]);
     } catch (err) {
-        console.error("❌ خطأ إرسال تليقرام:", err.response ? err.response.data : err.message);
+        console.error("❌ خطأ إرسال تليقرام:", err.response?.data || err.message);
     }
 }
 
-// ================ State ================
-const priceWindows = new Map(); // symbol -> [{ts, price}]
-const lastAlertTs = new Map();  // symbol -> timestamp
-
-// ================ Fetch top USDT symbols ================
-async function fetchTopUsdtSymbols(limit = TOP_N) {
-    try {
-        const res = await axios.get(`${BINANCE_REST}/ticker/24hr`);
-        const all = res.data;
-
-        const usdt = all
-            .filter(it => it.symbol.endsWith("USDT"))
-            .map(it => ({
-                symbol: it.symbol,
-                quoteVolume: parseFloat(it.quoteVolume || 0)
-            }))
-            .sort((a,b) => b.quoteVolume - a.quoteVolume)
-            .slice(0, limit)
-            .map(it => it.symbol);
-
-        return usdt;
-    } catch (err) {
-        console.error("❌ خطأ في جلب 24hr tickers:", err.message);
-        throw err;
-    }
-}
-
-// ================ WebSocket handling ================
 function makeStreamsUrl(symbols) {
     const parts = symbols.map(s => `${s.toLowerCase()}@aggTrade`);
     return `wss://stream.binance.com:9443/stream?streams=${parts.join('/')}`;
@@ -72,10 +42,8 @@ function makeStreamsUrl(symbols) {
 function startWsForSymbols(symbols) {
     if (!symbols.length) return;
 
-    const url = makeStreamsUrl(symbols);
+    const ws = new WebSocket(makeStreamsUrl(symbols));
     console.log("🔗 الاتصال بـ WebSocket لعدد أزواج:", symbols.length);
-
-    const ws = new WebSocket(url);
 
     ws.on('open', () => console.log("🟢 WebSocket مفتوح"));
 
@@ -89,10 +57,8 @@ function startWsForSymbols(symbols) {
             const price = parseFloat(d.p);
             const ts = d.T || Date.now();
 
-            // حفظ البيانات
             if (!priceWindows.has(sym)) priceWindows.set(sym, []);
             const arr = priceWindows.get(sym);
-
             arr.push({ ts, price });
 
             const cutoff = Date.now() - WINDOW_SEC*1000;
@@ -104,30 +70,25 @@ function startWsForSymbols(symbols) {
 
                 if (oldest > 0) {
                     const change = ((newest - oldest) / oldest) * 100;
+                    const lastAlert = lastAlertTs.get(sym) || 0;
 
-                    if (change >= THRESHOLD_PERCENT) {
-                        const lastAlert = lastAlertTs.get(sym) || 0;
+                    if (change >= THRESHOLD_PERCENT && (Date.now() - lastAlert > ALERT_COOLDOWN_SEC*1000)) {
+                        lastAlertTs.set(sym, Date.now());
 
-                        if (Date.now() - lastAlert > ALERT_COOLDOWN_SEC*1000) {
-                            lastAlertTs.set(sym, Date.now());
-
-                            const target = newest * 1.03;
-                            const msgText = 
+                        const target = newest * 1.03;
+                        const msgText = 
 `🚨 <b>${sym}</b>
 ارتفاع: ${change.toFixed(2)}% خلال ${WINDOW_SEC}s
 السعر الآن: ${newest}
 هدف (تقريبي): ${target.toFixed(newest < 1 ? 6 : 4)}`;
 
-                            console.log("🔔 إنذار:", sym, change.toFixed(2) + "%");
-                            sendToTelegram(msgText);
-                        }
+                        console.log("🔔 إنذار:", sym, change.toFixed(2) + "%");
+                        sendToTelegram(msgText);
                     }
                 }
             }
 
-        } catch (err) {
-            // تجاهل الأخطاء البسيطة
-        }
+        } catch (err) { /* تجاهل الأخطاء */ }
     });
 
     ws.on('close', () => {
@@ -141,29 +102,17 @@ function startWsForSymbols(symbols) {
     });
 }
 
-// ================ Main ================
-async function main() {
-    try {
-        console.log("⏳ جلب أفضل أزواج USDT...");
-        const topSymbols = await fetchTopUsdtSymbols();
-
-        console.log(`✅ تم اختيار ${topSymbols.length} زوج.`);
-
-        const groups = [];
-        for (let i = 0; i < topSymbols.length; i += MAX_STREAMS_PER_WS) {
-            groups.push(topSymbols.slice(i, i + MAX_STREAMS_PER_WS));
-        }
-
-        groups.forEach(g => startWsForSymbols(g));
-
-        setInterval(() => {
-            console.log(`💓 مراقبة ${topSymbols.length} زوج — نوافذ: ${priceWindows.size}`);
-        }, 60000);
-
-    } catch (err) {
-        console.error("❌ خطأ في main:", err.message);
-        setTimeout(main, 3000);
+// ================= Main =================
+function main() {
+    const groups = [];
+    for (let i = 0; i < TOP_SYMBOLS.length; i += MAX_STREAMS_PER_WS) {
+        groups.push(TOP_SYMBOLS.slice(i, i + MAX_STREAMS_PER_WS));
     }
+    groups.forEach(g => startWsForSymbols(g));
+
+    setInterval(() => {
+        console.log(`💓 مراقبة ${TOP_SYMBOLS.length} زوج — نوافذ: ${priceWindows.size}`);
+    }, 60000);
 }
 
 main();
