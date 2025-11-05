@@ -6,7 +6,10 @@ import http from 'http';
 // =======================================================
 const BOT_TOKEN = "8284632269:AAF6rgI-k-8gXsvodHWJD0iHpuAP5zDbdno";
 const CHAT_ID   = "47654327"; 
+const BINANCE_WS_URL = 'wss://stream.binance.com:9443/ws/!miniTicker@arr'; 
 
+// يجب إضافة هذه الدالة في Node.js لأن 'fetch' ليست معرفة بشكل عام بدون استيرادها، 
+// لكن في Render/Node.js الحديث قد تعمل دون استيراد.
 async function sendToTelegram(message) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
     const data = {
@@ -33,19 +36,18 @@ async function sendToTelegram(message) {
 }
 
 // =======================================================
-// 2. إعدادات WebSocket والزخم
+// 2. إعدادات WebSocket والزخم اللحظي
 // =======================================================
-const BINANCE_WS_URL = 'wss://stream.binance.com:9443/ws/!miniTicker@arr'; // بث جميع العملات
-const MOMENTUM_THRESHOLD_PERCENT_WS = 0.4; // 0.4% ارتفاع خلال الفترة
-const SNAPSHOT_INTERVAL_MS = 30000; // 30 ثانية لتخزين لقطة السعر
+const MOMENTUM_THRESHOLD_PERCENT_WS = 0.4; // نسبة الارتفاع المطلوبة (0.4%)
+const SNAPSHOT_INTERVAL_MS = 30000; // الفترة الزمنية للمقارنة (30 ثانية)
 
-// مخزن عالمي للأسعار
+// مخزن عالمي للأسعار (يحتفظ بآخر سعر ووقت لتحديد الزخم)
 const PRICE_SNAPSHOTS = {}; 
 
 // =======================================================
 // 3. الوظيفة الرئيسية: إدارة WebSocket
 // =======================================================
-async function startScanner() {
+function startScanner() {
     console.log(`📡 بدء الاتصال بـ WebSocket لرصد الزخم اللحظي...`);
 
     const ws = new WebSocket(BINANCE_WS_URL);
@@ -55,13 +57,13 @@ async function startScanner() {
     });
 
     ws.on('message', (data) => {
-        // يتم استقبال البيانات (Mini Tickers) لكل العملات
+        // يتم استقبال بيانات جميع العملات المقترنة بـ USDT في رسالة واحدة كل ثانية
         try {
             const tickers = JSON.parse(data.toString());
 
             tickers.forEach(ticker => {
                 const symbol = ticker.s; 
-                const currentPrice = parseFloat(ticker.c); // سعر الإغلاق (آخر سعر)
+                const currentPrice = parseFloat(ticker.c);
 
                 // 1. حساب الزخم والمقارنة
                 if (PRICE_SNAPSHOTS[symbol] && PRICE_SNAPSHOTS[symbol].lastPrice > 0) {
@@ -70,7 +72,7 @@ async function startScanner() {
 
                     const change = ((currentPrice - oldPrice) / oldPrice) * 100;
 
-                    // يتم إرسال الإشعار إذا تحقق الارتفاع المطلوب (0.4%) خلال فترة لا تقل عن 30 ثانية
+                    // إرسال الإشعار إذا تحقق الارتفاع المطلوب (MOMENTUM_THRESHOLD) خلال فترة كافية (SNAPSHOT_INTERVAL)
                     if (timeDiff >= SNAPSHOT_INTERVAL_MS && change >= MOMENTUM_THRESHOLD_PERCENT_WS) {
                         const targetPrice = (currentPrice * 1.03).toFixed(currentPrice < 1 ? 6 : 4);
                         const message = `🚀 انفجار لحظي! ${symbol}\nارتفاع ${change.toFixed(2)}% خلال ${(timeDiff / 1000).toFixed(1)} ثانية. هدف 3%: ${targetPrice}`;
@@ -85,8 +87,7 @@ async function startScanner() {
                     }
                 }
                 
-                // 2. تحديث اللقطة (الـ 30 ثانية)
-                // يتم حفظ آخر سعر إغلاق في المخزن كل 30 ثانية
+                // 2. تحديث اللقطة (يتم حفظ آخر سعر إغلاق كل 30 ثانية)
                 if (!PRICE_SNAPSHOTS[symbol] || Date.now() - PRICE_SNAPSHOTS[symbol].timestamp >= SNAPSHOT_INTERVAL_MS) {
                     PRICE_SNAPSHOTS[symbol] = {
                         lastPrice: currentPrice,
@@ -95,7 +96,7 @@ async function startScanner() {
                 }
             });
         } catch (e) {
-            // تجاهل أخطاء التنسيق العرضية في البيانات
+            // تجاهل أخطاء التنسيق العرضية
         }
     });
 
@@ -117,7 +118,7 @@ async function startScanner() {
 console.log("🚀 بدء تطبيق Binance Scanner Node.js...");
 startScanner();
 
-// هذا الجزء ضروري لـ Render لمنع السيرفر من الإغلاق (الحاجة لـ Port مفتوح)
+// هذا الخادم الصغير يضمن بقاء خدمة Render تعمل دون توقف
 const PORT = process.env.PORT || 8000;
 
 http.createServer((req, res) => {
