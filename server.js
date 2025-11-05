@@ -1,118 +1,128 @@
-require('dotenv').config();
-const WebSocket = require('ws');
-const axios = require('axios');
+import WebSocket from 'ws';
+import http from 'http';
 
-const BOT_TOKEN = process.env.BOT_TOKEN || "";
-const CHAT_ID = process.env.CHAT_ID || "";
+// =======================================================
+// 1. إعدادات تيليقرام
+// =======================================================
+const BOT_TOKEN = "8284632269:AAF6rgI-k-8gXsvodHWJD0iHpuAP5zDbdno";
+const CHAT_ID   = "47654327"; 
 
-if (!BOT_TOKEN || !CHAT_ID) {
-    console.error("✖ BOT_TOKEN أو CHAT_ID غير مضبوطين.");
-    process.exit(1);
-}
-
-const TOP_SYMBOLS = [
-    "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","ADAUSDT",
-    "SOLUSDT","DOGEUSDT","DOTUSDT","MATICUSDT","LTCUSDT"
-    // أضف باقي الرموز حسب حاجتك (150 رمز لو تحب)
-];
-
-const WINDOW_SEC = 20;
-const THRESHOLD_PERCENT = 0.4;
-const ALERT_COOLDOWN_SEC = 60;
-const MAX_STREAMS_PER_WS = 800;
-
-const priceWindows = new Map();
-const lastAlertTs = new Map();
-
-async function sendToTelegram(text) {
+async function sendToTelegram(message) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+    const data = {
+        chat_id: CHAT_ID,
+        text: message
+    };
+
     try {
-        await axios.post(url, { chat_id: CHAT_ID, text, parse_mode: "HTML" });
-        console.log("✅ إشعار تليقرام:", text.split("\n")[0]);
+        const response = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(data)
+        });
+        const result = await response.json();
+
+        if (result.ok === false) {
+            console.error("❌ فشل إرسال إشعار إلى تليقرام (API Error):", result.description);
+            return;
+        }
+        console.log("✅ تم إرسال الإشعار إلى تليقرام");
     } catch (err) {
-        console.error("❌ خطأ إرسال تليقرام:", err.response?.data || err.message);
+        console.error("❌ فشل إرسال إشعار إلى تليقرام (Fetch Error)", err);
     }
 }
 
-function makeStreamsUrl(symbols) {
-    const parts = symbols.map(s => `${s.toLowerCase()}@aggTrade`);
-    return `wss://stream.binance.com:9443/stream?streams=${parts.join('/')}`;
-}
+// =======================================================
+// 2. إعدادات WebSocket والزخم
+// =======================================================
+const BINANCE_WS_URL = 'wss://stream.binance.com:9443/ws/!miniTicker@arr'; // بث جميع العملات
+const MOMENTUM_THRESHOLD_PERCENT_WS = 0.4; // 0.4% ارتفاع خلال الفترة
+const SNAPSHOT_INTERVAL_MS = 30000; // 30 ثانية لتخزين لقطة السعر
 
-function startWsForSymbols(symbols) {
-    if (!symbols.length) return;
+// مخزن عالمي للأسعار
+const PRICE_SNAPSHOTS = {}; 
 
-    const ws = new WebSocket(makeStreamsUrl(symbols));
-    console.log("🔗 الاتصال بـ WebSocket لعدد أزواج:", symbols.length);
+// =======================================================
+// 3. الوظيفة الرئيسية: إدارة WebSocket
+// =======================================================
+async function startScanner() {
+    console.log(`📡 بدء الاتصال بـ WebSocket لرصد الزخم اللحظي...`);
 
-    ws.on('open', () => console.log("🟢 WebSocket مفتوح"));
+    const ws = new WebSocket(BINANCE_WS_URL);
 
-    ws.on('message', (raw) => {
+    ws.on('open', () => {
+        console.log('✅ تم فتح اتصال WebSocket بنجاح.');
+    });
+
+    ws.on('message', (data) => {
+        // يتم استقبال البيانات (Mini Tickers) لكل العملات
         try {
-            const msg = JSON.parse(raw.toString());
-            const d = msg.data;
-            if (!d || !d.s) return;
+            const tickers = JSON.parse(data.toString());
 
-            const sym = d.s;
-            const price = parseFloat(d.p);
-            const ts = d.T || Date.now();
+            tickers.forEach(ticker => {
+                const symbol = ticker.s; 
+                const currentPrice = parseFloat(ticker.c); // سعر الإغلاق (آخر سعر)
 
-            if (!priceWindows.has(sym)) priceWindows.set(sym, []);
-            const arr = priceWindows.get(sym);
-            arr.push({ ts, price });
+                // 1. حساب الزخم والمقارنة
+                if (PRICE_SNAPSHOTS[symbol] && PRICE_SNAPSHOTS[symbol].lastPrice > 0) {
+                    const oldPrice = PRICE_SNAPSHOTS[symbol].lastPrice;
+                    const timeDiff = Date.now() - PRICE_SNAPSHOTS[symbol].timestamp; 
 
-            const cutoff = Date.now() - WINDOW_SEC*1000;
-            while (arr.length && arr[0].ts < cutoff) arr.shift();
+                    const change = ((currentPrice - oldPrice) / oldPrice) * 100;
 
-            if (arr.length >= 2) {
-                const oldest = arr[0].price;
-                const newest = arr[arr.length - 1].price;
-
-                if (oldest > 0) {
-                    const change = ((newest - oldest) / oldest) * 100;
-                    const lastAlert = lastAlertTs.get(sym) || 0;
-
-                    if (change >= THRESHOLD_PERCENT && (Date.now() - lastAlert > ALERT_COOLDOWN_SEC*1000)) {
-                        lastAlertTs.set(sym, Date.now());
-
-                        const target = newest * 1.03;
-                        const msgText = 
-`🚨 <b>${sym}</b>
-ارتفاع: ${change.toFixed(2)}% خلال ${WINDOW_SEC}s
-السعر الآن: ${newest}
-هدف (تقريبي): ${target.toFixed(newest < 1 ? 6 : 4)}`;
-
-                        console.log("🔔 إنذار:", sym, change.toFixed(2) + "%");
-                        sendToTelegram(msgText);
+                    // يتم إرسال الإشعار إذا تحقق الارتفاع المطلوب (0.4%) خلال فترة لا تقل عن 30 ثانية
+                    if (timeDiff >= SNAPSHOT_INTERVAL_MS && change >= MOMENTUM_THRESHOLD_PERCENT_WS) {
+                        const targetPrice = (currentPrice * 1.03).toFixed(currentPrice < 1 ? 6 : 4);
+                        const message = `🚀 انفجار لحظي! ${symbol}\nارتفاع ${change.toFixed(2)}% خلال ${(timeDiff / 1000).toFixed(1)} ثانية. هدف 3%: ${targetPrice}`;
+                        
+                        sendToTelegram(message);
+                        
+                        // تحديث اللقطة لتجنب إرسال إشعار متكرر لنفس الحركة
+                        PRICE_SNAPSHOTS[symbol] = {
+                            lastPrice: currentPrice,
+                            timestamp: Date.now()
+                        };
                     }
                 }
-            }
+                
+                // 2. تحديث اللقطة (الـ 30 ثانية)
+                // يتم حفظ آخر سعر إغلاق في المخزن كل 30 ثانية
+                if (!PRICE_SNAPSHOTS[symbol] || Date.now() - PRICE_SNAPSHOTS[symbol].timestamp >= SNAPSHOT_INTERVAL_MS) {
+                    PRICE_SNAPSHOTS[symbol] = {
+                        lastPrice: currentPrice,
+                        timestamp: Date.now()
+                    };
+                }
+            });
+        } catch (e) {
+            // تجاهل أخطاء التنسيق العرضية في البيانات
+        }
+    });
 
-        } catch (err) { /* تجاهل الأخطاء */ }
+    ws.on('error', (err) => {
+        console.error('❌ حدث خطأ في اتصال WebSocket:', err);
     });
 
     ws.on('close', () => {
-        console.warn("⚠️ WebSocket مغلق، إعادة الاتصال...");
-        setTimeout(() => startWsForSymbols(symbols), 2000);
-    });
-
-    ws.on('error', (e) => {
-        console.error("❌ WebSocket Error:", e.message);
-        ws.terminate();
+        console.warn('⚠️ تم إغلاق اتصال WebSocket. إعادة الاتصال بعد 5 ثوانٍ...');
+        setTimeout(startScanner, 5000); // محاولة إعادة الاتصال التلقائية
     });
 }
 
-// ================= Main =================
-function main() {
-    const groups = [];
-    for (let i = 0; i < TOP_SYMBOLS.length; i += MAX_STREAMS_PER_WS) {
-        groups.push(TOP_SYMBOLS.slice(i, i + MAX_STREAMS_PER_WS));
-    }
-    groups.forEach(g => startWsForSymbols(g));
 
-    setInterval(() => {
-        console.log(`💓 مراقبة ${TOP_SYMBOLS.length} زوج — نوافذ: ${priceWindows.size}`);
-    }, 60000);
-}
+// =======================================================
+// 4. تشغيل التطبيق (Node.js/Render)
+// =======================================================
 
-main();
+console.log("🚀 بدء تطبيق Binance Scanner Node.js...");
+startScanner();
+
+// هذا الجزء ضروري لـ Render لمنع السيرفر من الإغلاق (الحاجة لـ Port مفتوح)
+const PORT = process.env.PORT || 8000;
+
+http.createServer((req, res) => {
+    res.writeHead(200, {'Content-Type': 'text/plain'});
+    res.end('Binance Scanner is running via WebSocket...');
+}).listen(PORT, () => {
+    console.log(`Web server running on port ${PORT}`);
+});
